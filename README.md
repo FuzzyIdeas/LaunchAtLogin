@@ -32,6 +32,16 @@ LaunchAtLogin.isEnabled = true
 
 `LaunchAtLogin.Toggle("Start at login")` and `LaunchAtLogin.Toggle { Text("Start at login") }` set another label.
 
+A view with its own control binds to `LaunchAtLogin.observable`, which redraws it when the status changes:
+
+```swift
+@ObservedObject private var launchAtLogin = LaunchAtLogin.observable
+
+MyToggle("Start at login", isOn: $launchAtLogin.isEnabled)
+```
+
+A change that fails is logged under the app's bundle identifier, category `LaunchAtLogin`.
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE).

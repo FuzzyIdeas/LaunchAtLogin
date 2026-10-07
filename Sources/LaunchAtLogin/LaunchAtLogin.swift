@@ -81,7 +81,8 @@
             var observing = false
         }
 
-        private static let logger = Logger(subsystem: "com.lowtechguys.LaunchAtLogin", category: "main")
+        /// Under the app's own subsystem, so its logs show a failed change.
+        private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "LaunchAtLogin", category: "LaunchAtLogin")
         private static let state = OSAllocatedUnfairLock(initialState: State())
         /// Serial, so changes reach the daemon in the order they were made, and reads never overtake them.
         private static let queue = DispatchQueue(label: "com.lowtechguys.LaunchAtLogin", qos: .userInitiated)
@@ -149,7 +150,7 @@
         /// publish changes.
         private static func publish() {
             Task { @MainActor in
-                observable.status = state.withLock { $0.status }
+                observable.cached = state.withLock { $0.status }
             }
         }
 
@@ -165,20 +166,41 @@
         }
     }
 
-    extension LaunchAtLogin {
+    public extension LaunchAtLogin {
+        /// Launch at login for views that bind to it some other way than `LaunchAtLogin.Toggle`, redrawn when the status
+        /// changes:
+        ///
+        /// ```
+        /// @ObservedObject private var launchAtLogin = LaunchAtLogin.observable
+        ///
+        /// MyToggle("Start at login", isOn: $launchAtLogin.isEnabled)
+        /// ```
         @MainActor
         final class Observable: ObservableObject {
+            public var isEnabled: Bool {
+                get { status == .enabled }
+                set {
+                    // A tap shows at once: setting a binding is a user action, never a view update, so it can publish.
+                    cached = newValue ? .enabled : .notRegistered
+                    LaunchAtLogin.isEnabled = newValue
+                }
+            }
+
+            public var status: SMAppService.Status {
+                cached ?? LaunchAtLogin.status
+            }
+
             /// Published only when it changes, so a re-read that finds the same status redraws nothing.
-            var status: SMAppService.Status? {
+            var cached: SMAppService.Status? {
                 willSet {
-                    if newValue != status {
+                    if newValue != cached {
                         objectWillChange.send()
                     }
                 }
             }
         }
 
-        @MainActor fileprivate static let observable = Observable()
+        @MainActor static let observable = Observable()
     }
 
     public extension LaunchAtLogin {
@@ -210,10 +232,7 @@
             }
 
             public var body: some View {
-                SwiftUI.Toggle(isOn: Binding(
-                    get: { (launchAtLogin.status ?? LaunchAtLogin.status) == .enabled },
-                    set: { LaunchAtLogin.isEnabled = $0 }
-                )) { label }
+                SwiftUI.Toggle(isOn: $launchAtLogin.isEnabled) { label }
             }
 
             @ObservedObject private var launchAtLogin = LaunchAtLogin.observable
