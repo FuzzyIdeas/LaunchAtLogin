@@ -3,6 +3,7 @@
 
 #if os(macOS)
     import AppKit
+    import Combine
     import os
     import ServiceManagement
     import SwiftUI
@@ -36,11 +37,7 @@
             let cached = state.withLock { state -> SMAppService.Status? in
                 guard let status = state.status else { return nil }
                 if Thread.isMainThread {
-                    // Marked stale when the app became active with no toggle on screen: read again in the background.
-                    if state.stale, !state.refreshing, state.pendingChanges == 0 {
-                        state.refreshing = true
-                        queue.async { reread() }
-                    }
+                    rereadIfStale(&state)
                     return status
                 }
                 return state.pendingChanges > 0 || now - state.readAt < 1 ? status : nil
@@ -80,16 +77,25 @@
             queue.async { reread() }
         }
 
-        static func toggleAppeared(_ appeared: Bool) {
-            let stale = state.withLock { state -> Bool in
-                state.visibleToggles = max(0, state.visibleToggles + (appeared ? 1 : -1))
-                guard appeared, state.stale, !state.refreshing else { return false }
-                state.refreshing = true
-                return true
+        /// A view started or stopped observing `observable`: SwiftUI subscribes to it while the view is on screen.
+        static func watching(_ started: Bool) {
+            state.withLock { state in
+                state.watchers = max(0, state.watchers + (started ? 1 : -1))
+                if started {
+                    rereadIfStale(&state)
+                }
             }
-            if stale {
-                queue.async { reread() }
-            }
+        }
+
+        /// From a read on the main thread: a status marked stale is read again in the background, once.
+        static func rereadIfStale() {
+            state.withLock { rereadIfStale(&$0) }
+        }
+
+        private static func rereadIfStale(_ state: inout State) {
+            guard state.stale, !state.refreshing, state.pendingChanges == 0, state.status != nil else { return }
+            state.refreshing = true
+            queue.async { reread() }
         }
 
         private struct State {
@@ -102,8 +108,8 @@
             /// The app became active since the last read, when nothing on screen showed the status.
             var stale = false
             var refreshing = false
-            /// `LaunchAtLogin.Toggle`s on screen, which get a fresh status as soon as the app becomes active.
-            var visibleToggles = 0
+            /// Views observing `observable`, which get a fresh status as soon as the app becomes active.
+            var watchers = 0
         }
 
         /// Under the app's own subsystem, so its logs show a failed change.
@@ -194,7 +200,7 @@
             // otherwise when a view next asks for it.
             NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil) { _ in
                 let now = state.withLock { state -> Bool in
-                    guard state.visibleToggles > 0, !state.refreshing else {
+                    guard state.watchers > 0, !state.refreshing else {
                         state.stale = true
                         return false
                     }
@@ -229,8 +235,14 @@
             }
 
             public var status: SMAppService.Status {
-                cached ?? LaunchAtLogin.status
+                guard let cached else { return LaunchAtLogin.status }
+                LaunchAtLogin.rereadIfStale()
+                return cached
             }
+
+            /// Counts the views subscribed to it, so the app becoming active reads the status again right away only when
+            /// a view shows it, whatever control the view draws it with.
+            public nonisolated let objectWillChange = WillChange()
 
             /// Published only when it changes, so a re-read that finds the same status redraws nothing.
             var cached: SMAppService.Status? {
@@ -240,6 +252,25 @@
                     }
                 }
             }
+        }
+
+        /// `Observable`'s change publisher, which tells `LaunchAtLogin` when views start and stop observing it.
+        struct WillChange: Publisher, @unchecked Sendable {
+            public typealias Output = Void
+            public typealias Failure = Never
+
+            public func receive<S: Subscriber>(subscriber: S) where S.Input == Void, S.Failure == Never {
+                LaunchAtLogin.watching(true)
+                subject
+                    .handleEvents(receiveCancel: { LaunchAtLogin.watching(false) })
+                    .receive(subscriber: subscriber)
+            }
+
+            func send() {
+                subject.send()
+            }
+
+            private let subject = PassthroughSubject<Void, Never>()
         }
 
         @MainActor static let observable = Observable()
@@ -275,8 +306,6 @@
 
             public var body: some View {
                 SwiftUI.Toggle(isOn: $launchAtLogin.isEnabled) { label }
-                    .onAppear { LaunchAtLogin.toggleAppeared(true) }
-                    .onDisappear { LaunchAtLogin.toggleAppeared(false) }
             }
 
             @ObservedObject private var launchAtLogin = LaunchAtLogin.observable

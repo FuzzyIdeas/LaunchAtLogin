@@ -6,7 +6,7 @@ Every read of `SMAppService.mainApp.status` is a synchronous call to that daemon
 
 ## What's different
 
-- The status is read once and kept, then read again off the main thread after every change, and when the app becomes active: right away while a `LaunchAtLogin.Toggle` is on screen, otherwise the next time a view asks for it
+- The status is read once and kept, then read again off the main thread after every change, and when the app becomes active: right away while a view shows it (`LaunchAtLogin.Toggle` or any view observing `LaunchAtLogin.observable`), otherwise the next time a view asks for it
 - Reading `isEnabled` or `status` off the main thread, where waiting costs no frames, reads it again when the kept status is more than a second old
 - Setting `isEnabled` shows the new value at once, and registers or unregisters off the main thread
 - `status` gives the whole `SMAppService.Status`, and `refresh()` reads it again
