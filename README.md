@@ -7,6 +7,7 @@ Every read of `SMAppService.mainApp.status` is a synchronous call to that daemon
 ## What's different
 
 - The status is read once and kept, then read again off the main thread when the app becomes active and after every change
+- Reading `isEnabled` or `status` off the main thread, where waiting costs no frames, reads it again when the kept status is more than a second old
 - Setting `isEnabled` shows the new value at once, and registers or unregisters off the main thread
 - `status` gives the whole `SMAppService.Status`, and `refresh()` reads it again
 - When the user turned the login item off in System Settings, turning it back on opens System Settings on Login Items, since only they can allow it there

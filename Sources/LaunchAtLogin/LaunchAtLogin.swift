@@ -24,20 +24,33 @@
             set { setEnabled(newValue) }
         }
 
-        /// The main app's login item status as last read: `.requiresApproval` when the user turned it off in System
-        /// Settings > General > Login Items, which only they can undo.
+        /// The main app's login item status: `.requiresApproval` when the user turned it off in System Settings >
+        /// General > Login Items, which only they can undo.
+        ///
+        /// On the main thread it's the status as last read. Off the main thread, where waiting costs no frames, a status
+        /// read more than a second ago is read again, so code answering a script or an agent while the app sits in the
+        /// background sees a change made in System Settings.
         public static var status: SMAppService.Status {
             startObserving()
-            if let status = state.withLock({ $0.status }) {
-                return status
+            let now = ProcessInfo.processInfo.systemUptime
+            let cached = state.withLock { state -> SMAppService.Status? in
+                guard let status = state.status else { return nil }
+                return Thread.isMainThread || state.pendingChanges > 0 || now - state.readAt < 1 ? status : nil
             }
-            // Nothing read yet: one synchronous read, so the first answer is the real one rather than a guess that a
-            // toggle would visibly flip from.
+            if let cached {
+                return cached
+            }
+            // Nothing read yet, or a stale read off the main thread. On the main thread this happens once, so the first
+            // answer is the real one rather than a guess that a toggle would visibly flip from.
             let read = SMAppService.mainApp.status
             let status = state.withLock { state -> SMAppService.Status in
-                let status = state.status ?? read
-                state.status = status
-                return status
+                // A change made meanwhile wins: the read may predate it.
+                if state.pendingChanges > 0, let status = state.status {
+                    return status
+                }
+                state.status = read
+                state.readAt = ProcessInfo.processInfo.systemUptime
+                return read
             }
             publish()
             return status
@@ -61,6 +74,8 @@
 
         private struct State {
             var status: SMAppService.Status?
+            /// `systemUptime` of the read behind `status`.
+            var readAt: TimeInterval = 0
             /// Changes waiting on `queue`: a read that lands meanwhile would show the old status, so it's skipped.
             var pendingChanges = 0
             var observing = false
@@ -77,6 +92,7 @@
             let current = state.withLock { state -> Bool in
                 guard state.pendingChanges == 0 else { return false }
                 state.status = status
+                state.readAt = ProcessInfo.processInfo.systemUptime
                 return true
             }
             if current {
@@ -116,6 +132,7 @@
                     state.pendingChanges -= 1
                     guard state.pendingChanges == 0 else { return false }
                     state.status = status
+                    state.readAt = ProcessInfo.processInfo.systemUptime
                     return true
                 }
                 guard last else { return }
