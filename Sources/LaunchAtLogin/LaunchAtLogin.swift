@@ -21,7 +21,7 @@
         /// value settles on what macOS reports.
         public static var isEnabled: Bool {
             get { status == .enabled }
-            set { setEnabled(newValue) }
+            set { setEnabled(newValue, fromControl: false) }
         }
 
         /// The main app's login item status: `.requiresApproval` when the user turned it off in System Settings >
@@ -35,7 +35,15 @@
             let now = ProcessInfo.processInfo.systemUptime
             let cached = state.withLock { state -> SMAppService.Status? in
                 guard let status = state.status else { return nil }
-                return Thread.isMainThread || state.pendingChanges > 0 || now - state.readAt < 1 ? status : nil
+                if Thread.isMainThread {
+                    // Marked stale when the app became active with no toggle on screen: read again in the background.
+                    if state.stale, !state.refreshing, state.pendingChanges == 0 {
+                        state.refreshing = true
+                        queue.async { reread() }
+                    }
+                    return status
+                }
+                return state.pendingChanges > 0 || now - state.readAt < 1 ? status : nil
             }
             if let cached {
                 return cached
@@ -72,6 +80,18 @@
             queue.async { reread() }
         }
 
+        static func toggleAppeared(_ appeared: Bool) {
+            let stale = state.withLock { state -> Bool in
+                state.visibleToggles = max(0, state.visibleToggles + (appeared ? 1 : -1))
+                guard appeared, state.stale, !state.refreshing else { return false }
+                state.refreshing = true
+                return true
+            }
+            if stale {
+                queue.async { reread() }
+            }
+        }
+
         private struct State {
             var status: SMAppService.Status?
             /// `systemUptime` of the read behind `status`.
@@ -79,6 +99,11 @@
             /// Changes waiting on `queue`: a read that lands meanwhile would show the old status, so it's skipped.
             var pendingChanges = 0
             var observing = false
+            /// The app became active since the last read, when nothing on screen showed the status.
+            var stale = false
+            var refreshing = false
+            /// `LaunchAtLogin.Toggle`s on screen, which get a fresh status as soon as the app becomes active.
+            var visibleToggles = 0
         }
 
         /// Under the app's own subsystem, so its logs show a failed change.
@@ -91,9 +116,11 @@
         private static func reread() {
             let status = SMAppService.mainApp.status
             let current = state.withLock { state -> Bool in
+                state.refreshing = false
                 guard state.pendingChanges == 0 else { return false }
                 state.status = status
                 state.readAt = ProcessInfo.processInfo.systemUptime
+                state.stale = false
                 return true
             }
             if current {
@@ -101,7 +128,9 @@
             }
         }
 
-        private static func setEnabled(_ enabled: Bool) {
+        /// `fromControl` when the user flipped a control: only then can System Settings open for an approval, never for a
+        /// change a script or an agent made.
+        static func setEnabled(_ enabled: Bool, fromControl: Bool) {
             startObserving()
             // Shown at once; macOS has the last word after the change.
             let shown: SMAppService.Status = enabled ? .enabled : .notRegistered
@@ -134,12 +163,13 @@
                     guard state.pendingChanges == 0 else { return false }
                     state.status = status
                     state.readAt = ProcessInfo.processInfo.systemUptime
+                    state.stale = false
                     return true
                 }
                 guard last else { return }
                 publish()
                 // Turned off in System Settings before: registering can't undo that, the user has to.
-                if enabled, status == .requiresApproval {
+                if enabled, fromControl, status == .requiresApproval {
                     DispatchQueue.main.async { SMAppService.openSystemSettingsLoginItems() }
                 }
             }
@@ -160,8 +190,20 @@
                 defer { state.observing = true }
                 return !state.observing
             }) else { return }
+            // Each read is a daemon lookup, and some apps become active often: read now only when a toggle shows the status,
+            // otherwise when a view next asks for it.
             NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil) { _ in
-                queue.async { reread() }
+                let now = state.withLock { state -> Bool in
+                    guard state.visibleToggles > 0, !state.refreshing else {
+                        state.stale = true
+                        return false
+                    }
+                    state.refreshing = true
+                    return true
+                }
+                if now {
+                    queue.async { reread() }
+                }
             }
         }
     }
@@ -182,7 +224,7 @@
                 set {
                     // A tap shows at once: setting a binding is a user action, never a view update, so it can publish.
                     cached = newValue ? .enabled : .notRegistered
-                    LaunchAtLogin.isEnabled = newValue
+                    LaunchAtLogin.setEnabled(newValue, fromControl: true)
                 }
             }
 
@@ -233,6 +275,8 @@
 
             public var body: some View {
                 SwiftUI.Toggle(isOn: $launchAtLogin.isEnabled) { label }
+                    .onAppear { LaunchAtLogin.toggleAppeared(true) }
+                    .onDisappear { LaunchAtLogin.toggleAppeared(false) }
             }
 
             @ObservedObject private var launchAtLogin = LaunchAtLogin.observable
