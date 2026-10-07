@@ -14,8 +14,8 @@
     /// round trip to the login items daemon, which validates the app's signature each time, and a SwiftUI `Toggle`
     /// reads its binding many times while a window is built, laid out and made key. Reading the status there blocked the
     /// main thread for most of the time a settings window took to open. Here it's read once, then again off the main
-    /// thread when the app becomes active (the user may have changed it in System Settings meanwhile) and after every
-    /// change, and views only ever see the cached value.
+    /// thread after every change, and when the app becomes active (the user may have changed it in System Settings
+    /// meanwhile): right away while a view shows it, otherwise when one next asks. Views only ever see the cached value.
     public enum LaunchAtLogin {
         /// Turns launch at login on or off, or tells whether it's on. Reading never blocks once the status has been read
         /// once. Setting updates the value right away and registers or unregisters off the main thread, after which the
@@ -34,13 +34,13 @@
         public static var status: SMAppService.Status {
             startObserving()
             let now = ProcessInfo.processInfo.systemUptime
-            let cached = state.withLock { state -> SMAppService.Status? in
-                guard let status = state.status else { return nil }
+            let (cached, activation) = state.withLock { state -> (SMAppService.Status?, Int) in
+                guard let status = state.status else { return (nil, state.activations) }
                 if Thread.isMainThread {
                     rereadIfStale(&state)
-                    return status
+                    return (status, state.activations)
                 }
-                return state.pendingChanges > 0 || now - state.readAt < 1 ? status : nil
+                return (state.pendingChanges > 0 || now - state.readAt < 1 ? status : nil, state.activations)
             }
             if let cached {
                 return cached
@@ -53,8 +53,7 @@
                 if state.pendingChanges > 0, let status = state.status {
                     return status
                 }
-                state.status = read
-                state.readAt = ProcessInfo.processInfo.systemUptime
+                store(read, readSince: activation, in: &state)
                 return read
             }
             publish()
@@ -74,7 +73,14 @@
         /// Call it early at launch so the first view to ask already has the answer.
         public static func refresh() {
             startObserving()
-            queue.async { reread() }
+            let start = state.withLock { state -> Bool in
+                guard !state.refreshing else { return false }
+                state.refreshing = true
+                return true
+            }
+            if start {
+                queue.async { reread() }
+            }
         }
 
         /// A view started or stopped observing `observable`: SwiftUI subscribes to it while the view is on screen.
@@ -105,9 +111,11 @@
             /// Changes waiting on `queue`: a read that lands meanwhile would show the old status, so it's skipped.
             var pendingChanges = 0
             var observing = false
-            /// The app became active since the last read, when nothing on screen showed the status.
+            /// The app became active since the last read finished.
             var stale = false
             var refreshing = false
+            /// Times the app became active, so a read knows whether one happened while it ran.
+            var activations = 0
             /// Views observing `observable`, which get a fresh status as soon as the app becomes active.
             var watchers = 0
         }
@@ -120,18 +128,37 @@
 
         /// Runs on `queue`.
         private static func reread() {
+            let activation = state.withLock { $0.activations }
             let status = SMAppService.mainApp.status
-            let current = state.withLock { state -> Bool in
+            let (current, again) = state.withLock { state -> (Bool, Bool) in
                 state.refreshing = false
-                guard state.pendingChanges == 0 else { return false }
-                state.status = status
-                state.readAt = ProcessInfo.processInfo.systemUptime
-                state.stale = false
-                return true
+                guard state.pendingChanges == 0 else { return (false, false) }
+                store(status, readSince: activation, in: &state)
+                return (true, readAgainIfWatched(&state))
             }
             if current {
                 publish()
             }
+            if again {
+                queue.async { reread() }
+            }
+        }
+
+        /// Keeps a read, and clears the stale mark only when the app didn't become active again while it ran: the change
+        /// that brought the user back may be newer than the read.
+        private static func store(_ status: SMAppService.Status, readSince activation: Int, in state: inout State) {
+            state.status = status
+            state.readAt = ProcessInfo.processInfo.systemUptime
+            if state.activations == activation {
+                state.stale = false
+            }
+        }
+
+        /// Still stale after a read, with a view showing the status: one more read.
+        private static func readAgainIfWatched(_ state: inout State) -> Bool {
+            guard state.stale, state.watchers > 0, !state.refreshing else { return false }
+            state.refreshing = true
+            return true
         }
 
         /// `fromControl` when the user flipped a control: only then can System Settings open for an approval, never for a
@@ -147,6 +174,7 @@
             publish()
 
             queue.async {
+                let activation = state.withLock { $0.activations }
                 let service = SMAppService.mainApp
                 do {
                     if enabled {
@@ -164,15 +192,16 @@
                 }
 
                 let status = service.status
-                let last = state.withLock { state -> Bool in
+                let (last, again) = state.withLock { state -> (Bool, Bool) in
                     state.pendingChanges -= 1
-                    guard state.pendingChanges == 0 else { return false }
-                    state.status = status
-                    state.readAt = ProcessInfo.processInfo.systemUptime
-                    state.stale = false
-                    return true
+                    guard state.pendingChanges == 0 else { return (false, false) }
+                    store(status, readSince: activation, in: &state)
+                    return (true, readAgainIfWatched(&state))
                 }
                 guard last else { return }
+                if again {
+                    queue.async { reread() }
+                }
                 publish()
                 // Turned off in System Settings before: registering can't undo that, the user has to.
                 if enabled, fromControl, status == .requiresApproval {
@@ -196,14 +225,13 @@
                 defer { state.observing = true }
                 return !state.observing
             }) else { return }
-            // Each read is a daemon lookup, and some apps become active often: read now only when a toggle shows the status,
-            // otherwise when a view next asks for it.
+            // Each read is a daemon lookup, and some apps become active often: read now only while a view shows the status,
+            // otherwise when one next asks for it.
             NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil) { _ in
                 let now = state.withLock { state -> Bool in
-                    guard state.watchers > 0, !state.refreshing else {
-                        state.stale = true
-                        return false
-                    }
+                    state.activations += 1
+                    state.stale = true
+                    guard state.watchers > 0, !state.refreshing else { return false }
                     state.refreshing = true
                     return true
                 }
